@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
 """
-ryu_insdn_full.py (updated)
+ryu_insdn_full.py (complete, API-enabled)
 
 - Simple learning switch
 - PacketIn-based per-packet capture
 - Bidirectional 5-tuple flow buckets
-- Computes an InSDN/CICFlowMeter-style 84+ feature set (exactly your HEADERS order)
+- Computes an InSDN/CICFlowMeter-style 84+ feature set (exactly HEADERS order)
 - Label injection via /tmp/current_label
 - Writes rows to /tmp/insdn_features.csv with immediate flush
+- Posts every finalized flow to an HTTP API in non-blocking fashion (optional)
 
-Notes:
-- PacketIn heavy workloads can overwhelm the controller: consider sampling/mirroring for scale.
-- "First packet defines forward direction" convention is used.
+ENV:
+  INSND_SEND_TO_API=1|0                 # enable/disable API posts (default 1)
+  INSND_API_URL=http://127.0.0.1:8000/predict-row
+  INSND_API_TIMEOUT=0.5                 # seconds
 """
-
 import os
 import time
 import csv
+import json
 import threading
 import statistics
 from collections import defaultdict, namedtuple, Counter
+import socket
+import struct
 
+# Ryu imports
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import (
@@ -30,16 +35,86 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 from ryu.lib.packet import packet, ethernet, ipv4
 
-# ----------------- CONFIG -----------------
+# ----------------- API CONFIG -----------------
+API_URL = os.getenv("INSND_API_URL", "http://127.0.0.1:8000/predict-row")
+SEND_TO_API = os.getenv("INSND_SEND_TO_API", "1") == "1"
+API_TIMEOUT = float(os.getenv("INSND_API_TIMEOUT", "0.5"))  # seconds
+
+# ----------------- IDS CONFIG -----------------
 CSV_OUT = '/tmp/insdn_features.csv'
-PACKET_CACHE_TTL = 4.0            # seconds of inactivity before a flow is flushed
-POLL_INTERVAL = 1.0               # OFPFlowStatsRequest interval (kept for future port-level stats)
+PACKET_CACHE_TTL = 4.0
+POLL_INTERVAL = 1.0
 INITIAL_WINDOW_PKTS = 10
-SUBFLOW_GAP = 1.0                 # seconds to split active/idle windows
-BULK_PKT_SIZE = 1000              # bytes threshold for bulk metrics
-BULK_IAT = 1.0                    # seconds between packets in a bulk
-SAMPLE_EVERY_N = 1                # Packet sampling (1 = no sampling)
-# ------------------------------------------
+SUBFLOW_GAP = 1.0
+BULK_PKT_SIZE = 1000
+BULK_IAT = 1.0
+SAMPLE_EVERY_N = 1
+
+# 12-col model schema convenience
+MODEL_COLUMNS = [
+    "Src IP", "Dst IP", "Dst Port", "Flow Duration", "Flow Pkts/s",
+    "Flow IAT Mean", "Bwd IAT Tot", "Bwd IAT Mean", "Bwd IAT Max",
+    "Bwd Header Len", "Bwd Pkts/s", "Init Bwd Win Byts"
+]
+
+RYU_TO_MODEL = {
+    "SrcIP":               "Src IP",
+    "DstIP":               "Dst IP",
+    "DstPort":             "Dst Port",
+    "Flow_Duration_s":     "Flow Duration",
+    "Flow_Pkts_per_s":     "Flow Pkts/s",
+    "Flow_IAT_Mean":       "Flow IAT Mean",
+    "Bwd_IAT_Tot":         "Bwd IAT Tot",
+    "Bwd_IAT_Mean":        "Bwd IAT Mean",
+    "Bwd_IAT_Max":         "Bwd IAT Max",
+    "Bwd_Header_Len":      "Bwd Header Len",
+    "Bwd_Pkts_per_s":      "Bwd Pkts/s",
+    "Init_Bwd_Win_Bytes":  "Init Bwd Win Byts",
+}
+
+def ip_to_int(ip: str) -> int:
+    try:
+        return struct.unpack("!I", socket.inet_aton(ip))[0]
+    except Exception:
+        return 0
+
+def to_number(x):
+    try:
+        if x is None or x == "":
+            return 0
+        if isinstance(x, (int, float)):
+            return x
+        return float(x)
+    except Exception:
+        return 0
+
+# -------- HEADERS (84+)
+HEADERS = [
+    "FlowID","SrcIP","SrcPort","DstIP","DstPort","Protocol","StartTime",
+    "Fwd_Header_Len","Bwd_Header_Len",
+    "Tot_Fwd_Pkts","Tot_Bwd_Pkts","Tot_Fwd_Bytes","Tot_Bwd_Bytes",
+    "Fwd_PktLen_Min","Fwd_PktLen_Mean","Fwd_PktLen_Max","Fwd_PktLen_Std",
+    "Bwd_PktLen_Min","Bwd_PktLen_Mean","Bwd_PktLen_Max","Bwd_PktLen_Std",
+    "PktLen_Min","PktLen_Mean","PktLen_Max","PktLen_Var","PktLen_Std",
+    "Flow_Duration_s",
+    "Flow_IAT_Min","Flow_IAT_Mean","Flow_IAT_Max","Flow_IAT_Std",
+    "Fwd_IAT_Tot","Fwd_IAT_Min","Fwd_IAT_Mean","Fwd_IAT_Max","Fwd_IAT_Std",
+    "Bwd_IAT_Tot","Bwd_IAT_Min","Bwd_IAT_Mean","Bwd_IAT_Max","Bwd_IAT_Std",
+    "Active_Min","Active_Mean","Active_Max","Active_Std",
+    "Idle_Min","Idle_Mean","Idle_Max","Idle_Std",
+    "Fwd_PSH","Bwd_PSH","Fwd_URG","Bwd_URG",
+    "FIN_Count","SYN_Count","RST_Count","PSH_Count","ACK_Count","URG_Count","CWR_Count","ECE_Count",
+    "DownUp_Ratio","Fwd_Seg_Avg","Bwd_Seg_Avg",
+    "Fwd_Bulk_Byts_Avg","Fwd_Bulk_Pkts_Avg","Fwd_Bulk_Rate_Avg",
+    "Bwd_Bulk_Byts_Avg","Bwd_Bulk_Pkts_Avg","Bwd_Bulk_Rate_Avg",
+    "Init_Fwd_Win_Bytes","Init_Bwd_Win_Bytes",
+    "Fwd_Act_Data_Pkts","Fwd_Seg_Size_Min",
+    "Flow_Bytes_per_s","Flow_Pkts_per_s","Fwd_Pkts_per_s","Bwd_Pkts_per_s",
+    "Subflow_Fwd_Pkts_Avg","Subflow_Fwd_Bytes_Avg","Subflow_Bwd_Pkts_Avg","Subflow_Bwd_Bytes_Avg",
+    "TTL_Avg","TTL_Min","TTL_Max","Unique_Src_Ports","Unique_Dst_Ports",
+    "Packet_Size_Mode","Packet_Size_Median","First_Payload_Bytes",
+    "Label"
+]
 
 PacketRec = namedtuple('PacketRec', [
     'ts', 'length', 'dir', 'tcp_flags', 'eth_hdr_len', 'ip_hdr_len', 'l4_hdr_len'
@@ -57,71 +132,20 @@ def read_label_file():
     except Exception:
         return 0
 
-# ----------------- HEADERS (84+ InSDN-like) -----------------
-HEADERS = [
-    # IDs/meta
-    "FlowID","SrcIP","SrcPort","DstIP","DstPort","Protocol","StartTime",
-    # header lengths
-    "Fwd_Header_Len","Bwd_Header_Len",
-    # packet-level counts & byte sums
-    "Tot_Fwd_Pkts","Tot_Bwd_Pkts","Tot_Fwd_Bytes","Tot_Bwd_Bytes",
-    # pkt-len stats forward (min,mean,max,std)
-    "Fwd_PktLen_Min","Fwd_PktLen_Mean","Fwd_PktLen_Max","Fwd_PktLen_Std",
-    # pkt-len stats backward
-    "Bwd_PktLen_Min","Bwd_PktLen_Mean","Bwd_PktLen_Max","Bwd_PktLen_Std",
-    # aggregated pkt-len
-    "PktLen_Min","PktLen_Mean","PktLen_Max","PktLen_Var","PktLen_Std",
-    # duration, IATs
-    "Flow_Duration_s",
-    "Flow_IAT_Min","Flow_IAT_Mean","Flow_IAT_Max","Flow_IAT_Std",
-    "Fwd_IAT_Tot","Fwd_IAT_Min","Fwd_IAT_Mean","Fwd_IAT_Max","Fwd_IAT_Std",
-    "Bwd_IAT_Tot","Bwd_IAT_Min","Bwd_IAT_Mean","Bwd_IAT_Max","Bwd_IAT_Std",
-    # active/idle
-    "Active_Min","Active_Mean","Active_Max","Active_Std",
-    "Idle_Min","Idle_Mean","Idle_Max","Idle_Std",
-    # TCP flags (directional and totals)
-    "Fwd_PSH","Bwd_PSH","Fwd_URG","Bwd_URG",
-    "FIN_Count","SYN_Count","RST_Count","PSH_Count","ACK_Count","URG_Count","CWR_Count","ECE_Count",
-    # flow-level behaviour
-    "DownUp_Ratio","Fwd_Seg_Avg","Bwd_Seg_Avg",
-    # bulk metrics
-    "Fwd_Bulk_Byts_Avg","Fwd_Bulk_Pkts_Avg","Fwd_Bulk_Rate_Avg",
-    "Bwd_Bulk_Byts_Avg","Bwd_Bulk_Pkts_Avg","Bwd_Bulk_Rate_Avg",
-    # init windows
-    "Init_Fwd_Win_Bytes","Init_Bwd_Win_Bytes",
-    # forward act data pkts, seg size min
-    "Fwd_Act_Data_Pkts","Fwd_Seg_Size_Min",
-    # rates
-    "Flow_Bytes_per_s","Flow_Pkts_per_s","Fwd_Pkts_per_s","Bwd_Pkts_per_s",
-    # subflow averages
-    "Subflow_Fwd_Pkts_Avg","Subflow_Fwd_Bytes_Avg","Subflow_Bwd_Pkts_Avg","Subflow_Bwd_Bytes_Avg",
-    # additional features
-    "TTL_Avg","TTL_Min","TTL_Max","Unique_Src_Ports","Unique_Dst_Ports",
-    "Packet_Size_Mode","Packet_Size_Median","First_Payload_Bytes",
-    # label
-    "Label"
-]
-
-# ----------------- FlowBucket -----------------
 class FlowBucket:
     def __init__(self):
-        self.packets = []             # [PacketRec]
+        self.packets = []
         self.first_ts = None
         self.last_ts = None
         self.total_bytes = 0
         self.total_pkts = 0
         self.forward_ip = None
-        # header accumulators
         self.fwd_header_bytes = 0; self.fwd_hdr_cnt = 0
         self.bwd_header_bytes = 0; self.bwd_hdr_cnt = 0
-        # TTL values
         self.ttl_vals = []
-        # unique port tracking
         self.src_ports = set(); self.dst_ports = set()
-        # packet sizes for median/mode
         self.size_counter = Counter()
 
-# ----------------- RYU APP -----------------
 class InSDNFullApp(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -132,7 +156,6 @@ class InSDNFullApp(app_manager.RyuApp):
         self.lock = threading.Lock()
         self.mac_to_port = defaultdict(dict)
 
-        # Prepare CSV
         os.makedirs(os.path.dirname(CSV_OUT) or '/tmp', exist_ok=True)
         write_header = not os.path.exists(CSV_OUT)
         self.csv_fh = open(CSV_OUT, 'a', newline='')
@@ -141,12 +164,10 @@ class InSDNFullApp(app_manager.RyuApp):
             self.csv_writer.writerow(HEADERS)
             self.csv_fh.flush()
 
-        # Background tasks
         self.poller = hub.spawn(self._poller)
         self.gc = hub.spawn(self._gc_loop)
         self.logger.info("InSDNFullApp started, writing %s", CSV_OUT)
 
-    # -------- datapath lifecycle --------
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change(self, ev):
         dp = ev.datapath
@@ -158,13 +179,11 @@ class InSDNFullApp(app_manager.RyuApp):
                 del self.datapaths[dp.id]
                 self.logger.info("Unregistered datapath dpid=%s", dp.id)
 
-    # -------- install table-miss --------
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def _switch_features(self, ev):
         dp = ev.msg.datapath
         parser = dp.ofproto_parser
         ofp = dp.ofproto
-
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
@@ -172,18 +191,15 @@ class InSDNFullApp(app_manager.RyuApp):
         dp.send_msg(mod)
         self.logger.info("Installed table-miss on dpid=%s", dp.id)
 
-    # -------- PacketIn: learning switch + capture --------
     _pkt_counter = 0
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in(self, ev):
         msg = ev.msg
         dp = msg.datapath
-        ofp = dp.ofproto
         parser = dp.ofproto_parser
         in_port = msg.match.get('in_port')
 
-        # Learning switch
         data = msg.data
         pkt = packet.Packet(data)
         eth = pkt.get_protocol(ethernet.ethernet)
@@ -193,14 +209,14 @@ class InSDNFullApp(app_manager.RyuApp):
         dpid = dp.id
 
         self.mac_to_port[dpid][src] = in_port
-        out_port = self.mac_to_port[dpid].get(dst, ofp.OFPP_FLOOD)
+        out_port = self.mac_to_port[dpid].get(dst, dp.ofproto.OFPP_FLOOD)
 
         actions = [parser.OFPActionOutput(out_port)]
-        if out_port != ofp.OFPP_FLOOD:
+        if out_port != dp.ofproto.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_src=src, eth_dst=dst)
             mod = parser.OFPFlowMod(
                 datapath=dp, priority=1, match=match,
-                instructions=[parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)],
+                instructions=[parser.OFPInstructionActions(dp.ofproto.OFPIT_APPLY_ACTIONS, actions)],
                 buffer_id=msg.buffer_id
             )
             dp.send_msg(mod)
@@ -210,16 +226,14 @@ class InSDNFullApp(app_manager.RyuApp):
             buffer_id=msg.buffer_id,
             in_port=in_port,
             actions=actions,
-            data=data if msg.buffer_id == ofp.OFPCML_NO_BUFFER or msg.buffer_id == ofp.OFP_NO_BUFFER else None
+            data=data if msg.buffer_id == dp.ofproto.OFPCML_NO_BUFFER or msg.buffer_id == dp.ofproto.OFP_NO_BUFFER else None
         )
         dp.send_msg(out)
 
-        # Sampling if requested
         self._pkt_counter += 1
         if SAMPLE_EVERY_N > 1 and (self._pkt_counter % SAMPLE_EVERY_N):
             return
 
-        # ---- Feature capture (IPv4 only) ----
         ts = time.time()
         ip4 = pkt.get_protocol(ipv4.ipv4)
         if ip4 is None:
@@ -228,7 +242,6 @@ class InSDNFullApp(app_manager.RyuApp):
         proto = ip4.proto
         src_ip = ip4.src; dst_ip = ip4.dst
 
-        # Header lengths (safe parsing)
         eth_hdr_len = 14
         ip_hdr_len = 20
         try:
@@ -242,19 +255,18 @@ class InSDNFullApp(app_manager.RyuApp):
         src_port = 0; dst_port = 0; tcp_flags = 0
 
         try:
-            if proto == 6 and len(data) >= l4_offset + 20:  # TCP
+            if proto == 6 and len(data) >= l4_offset + 20:
                 src_port = (data[l4_offset] << 8) | data[l4_offset+1]
                 dst_port = (data[l4_offset+2] << 8) | data[l4_offset+3]
                 tcp_flags = data[l4_offset+13]
                 l4_hdr_len = ((data[l4_offset+12] >> 4) & 0x0F) * 4 or 20
-            elif proto == 17 and len(data) >= l4_offset + 8:  # UDP
+            elif proto == 17 and len(data) >= l4_offset + 8:
                 src_port = (data[l4_offset] << 8) | data[l4_offset+1]
                 dst_port = (data[l4_offset+2] << 8) | data[l4_offset+3]
                 l4_hdr_len = 8
             else:
                 l4_hdr_len = 0
         except Exception:
-            # leave defaults
             pass
 
         key = (src_ip, dst_ip, src_port, dst_port, proto)
@@ -283,20 +295,15 @@ class InSDNFullApp(app_manager.RyuApp):
                 bucket.bwd_header_bytes += (eth_hdr_len + ip_hdr_len + l4_hdr_len)
                 bucket.bwd_hdr_cnt += 1
 
-            # TTL
             try:
                 bucket.ttl_vals.append(ip4.ttl)
             except Exception:
                 pass
 
-            # ports (for uniqueness stats)
             bucket.src_ports.add(src_port)
             bucket.dst_ports.add(dst_port)
-
-            # size histogram
             bucket.size_counter.update([plen])
 
-    # -------- poller kept for future extensions --------
     def _poller(self):
         while True:
             for dp in list(self.datapaths.values()):
@@ -307,10 +314,8 @@ class InSDNFullApp(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply(self, ev):
-        # Not used for dataset generation (PacketIn is our source).
         pass
 
-    # -------- GC: finalize idle flows to CSV --------
     def _gc_loop(self):
         while True:
             now = time.time()
@@ -324,6 +329,10 @@ class InSDNFullApp(app_manager.RyuApp):
                 try:
                     row = self._compute_features_row(key, bucket)
                     self._write_row(row)
+                    if SEND_TO_API:
+                        payload = self._build_api_payload(row)
+                        # spawn an async task to POST (import requests lazily)
+                        hub.spawn(self._post_row_async, payload)
                     self.logger.info(
                         "WROTE flow %s label=%s pkts=%d bytes=%d",
                         key, row[-1], bucket.total_pkts, bucket.total_bytes
@@ -333,33 +342,79 @@ class InSDNFullApp(app_manager.RyuApp):
             hub.sleep(0.5)
 
     def _write_row(self, row):
-        # Ensure exact alignment with HEADERS (pad/trim defensively)
         if len(row) < len(HEADERS):
             row = row + [0] * (len(HEADERS) - len(row))
         elif len(row) > len(HEADERS):
             row = row[:len(HEADERS)]
-        self.csv_writer.writerow(row)
-        self.csv_fh.flush()
+        try:
+            self.csv_writer.writerow(row)
+            self.csv_fh.flush()
+        except Exception as e:
+            self.logger.exception("CSV write failed: %s", e)
 
-    # -------- feature computations --------
+    def _row_to_dict(self, row):
+        out = {}
+        for i, h in enumerate(HEADERS):
+            out[h] = row[i] if i < len(row) else 0
+        return out
+
+    def _build_model_12(self, ryu_row: dict):
+        out = {k: 0 for k in MODEL_COLUMNS}
+        out["Src IP"] = ip_to_int(str(ryu_row.get("SrcIP", "0.0.0.0")))
+        out["Dst IP"] = ip_to_int(str(ryu_row.get("DstIP", "0.0.0.0")))
+        for ryu_name, model_name in RYU_TO_MODEL.items():
+            if model_name in ("Src IP", "Dst IP"):
+                continue
+            out[model_name] = to_number(ryu_row.get(ryu_name, 0))
+        return out
+
+    def _build_api_payload(self, row):
+        ryu_row = self._row_to_dict(row)
+        model_row = self._build_model_12(ryu_row)
+        payload = {
+            "flow_id": ryu_row.get("FlowID"),
+            "start_time": ryu_row.get("StartTime"),
+            "meta": {
+                "src_ip": ryu_row.get("SrcIP"),
+                "dst_ip": ryu_row.get("DstIP"),
+                "src_port": ryu_row.get("SrcPort"),
+                "dst_port": ryu_row.get("DstPort"),
+                "protocol": ryu_row.get("Protocol"),
+            },
+            "ryu_row": ryu_row,
+            "model_row": model_row,
+            "model_columns": MODEL_COLUMNS,
+        }
+        return payload
+
+    def _post_row_async(self, payload: dict):
+        # lazy import to avoid import-time SSL/urllib3 problems inside ryu-manager
+        try:
+            import requests
+        except Exception as e:
+            self.logger.debug("requests import failed (skipping API post): %s", e)
+            return
+        try:
+            r = requests.post(API_URL, json=payload, timeout=API_TIMEOUT)
+            if r.status_code >= 300:
+                self.logger.warning("API %s returned %s: %s", API_URL, r.status_code, r.text[:200])
+        except Exception as e:
+            self.logger.debug("API post failed: %s", e)
+
+    # ------------- feature computation (unchanged logic) --------------
     def _compute_features_row(self, key, bucket: FlowBucket):
         (src_ip, dst_ip, src_port, dst_port, proto) = key
         start_ts = bucket.first_ts or 0.0
         duration = (bucket.last_ts - bucket.first_ts) if (bucket.first_ts and bucket.last_ts) else 0.0
-
-        # Split directions
         fwd = [p for p in bucket.packets if p.dir == 'fwd']
         bwd = [p for p in bucket.packets if p.dir == 'bwd']
 
-        # Header length averages
         fwd_hdr_len = int(bucket.fwd_header_bytes / bucket.fwd_hdr_cnt) if bucket.fwd_hdr_cnt else 0
         bwd_hdr_len = int(bucket.bwd_header_bytes / bucket.bwd_hdr_cnt) if bucket.bwd_hdr_cnt else 0
 
-        # Counts & bytes
         tot_fwd_pkts = len(fwd); tot_bwd_pkts = len(bwd)
         tot_fwd_bytes = sum(p.length for p in fwd); tot_bwd_bytes = sum(p.length for p in bwd)
 
-        # Packet length stats
         fwd_lens = [p.length for p in fwd]
         bwd_lens = [p.length for p in bwd]
         all_lens = [p.length for p in bucket.packets]
@@ -368,7 +423,6 @@ class InSDNFullApp(app_manager.RyuApp):
         F_fwd_mean = safe_mean(fwd_lens)
         F_fwd_max = max(fwd_lens) if fwd_lens else 0
         F_fwd_std = safe_std(fwd_lens)
-
         B_bwd_min = min(bwd_lens) if bwd_lens else 0
         B_bwd_mean = safe_mean(bwd_lens)
         B_bwd_max = max(bwd_lens) if bwd_lens else 0
@@ -382,7 +436,6 @@ class InSDNFullApp(app_manager.RyuApp):
         P_median = statistics.median(all_lens) if all_lens else 0
         P_mode = bucket.size_counter.most_common(1)[0][0] if bucket.size_counter else 0
 
-        # IATs
         def iat_series(pkts):
             if len(pkts) < 2: return []
             times = [p.ts for p in sorted(pkts, key=lambda x: x.ts)]
@@ -401,14 +454,12 @@ class InSDNFullApp(app_manager.RyuApp):
         Fwd_IAT_Mean = safe_mean(fwd_iats) if fwd_iats else 0.0
         Fwd_IAT_Max = max(fwd_iats) if fwd_iats else 0.0
         Fwd_IAT_Std = safe_std(fwd_iats) if len(fwd_iats) > 1 else 0.0
-
         Bwd_IAT_Tot = sum(bwd_iats) if bwd_iats else 0.0
         Bwd_IAT_Min = min(bwd_iats) if bwd_iats else 0.0
         Bwd_IAT_Mean = safe_mean(bwd_iats) if bwd_iats else 0.0
         Bwd_IAT_Max = max(bwd_iats) if bwd_iats else 0.0
         Bwd_IAT_Std = safe_std(bwd_iats) if len(bwd_iats) > 1 else 0.0
 
-        # Active/Idle stats
         def active_idle(pkts):
             if not pkts:
                 return (0,0,0,0, 0,0,0,0)
@@ -436,7 +487,6 @@ class InSDNFullApp(app_manager.RyuApp):
 
         A_min, A_mean, A_max, A_std, I_min, I_mean, I_max, I_std = active_idle(bucket.packets)
 
-        # Flags
         def count_flags(pkts):
             SYN=ACK=FIN=RST=PSH=URG=CWR=ECE=0
             for p in pkts:
@@ -455,12 +505,10 @@ class InSDNFullApp(app_manager.RyuApp):
         bwd_flags = count_flags(bwd)
         tot_flags = count_flags(bucket.packets)
 
-        # Flow behaviour
         down_up_ratio = (tot_bwd_bytes / tot_fwd_bytes) if tot_fwd_bytes > 0 else (float(tot_bwd_bytes) if tot_bwd_bytes > 0 else 0.0)
         fwd_seg_avg = safe_mean(fwd_lens) if fwd_lens else 0.0
         bwd_seg_avg = safe_mean(bwd_lens) if bwd_lens else 0.0
 
-        # Bulk metrics
         def compute_bulk(pkts):
             if not pkts: return (0.0, 0.0, 0.0)
             bulks = []; cur = []
@@ -490,23 +538,19 @@ class InSDNFullApp(app_manager.RyuApp):
         Fwd_Bulk_Byts_Avg, Fwd_Bulk_Pkts_Avg, Fwd_Bulk_Rate_Avg = compute_bulk(fwd)
         Bwd_Bulk_Byts_Avg, Bwd_Bulk_Pkts_Avg, Bwd_Bulk_Rate_Avg = compute_bulk(bwd)
 
-        # Init windows (sum of first N packet sizes)
         init_fwd = sum(p.length for p in sorted(fwd, key=lambda x: x.ts)[:INITIAL_WINDOW_PKTS])
         init_bwd = sum(p.length for p in sorted(bwd, key=lambda x: x.ts)[:INITIAL_WINDOW_PKTS])
 
-        # Forward active data packets (payload present)
         fwd_act_data_pkts = sum(
             1 for p in fwd if p.length > (p.eth_hdr_len + p.ip_hdr_len + p.l4_hdr_len)
         )
         fwd_seg_min = min(fwd_lens) if fwd_lens else 0
 
-        # Rates (guard divide by zero)
         flow_bps = (bucket.total_bytes / duration) if duration > 0 else 0.0
         flow_pps = (bucket.total_pkts / duration) if duration > 0 else 0.0
         fwd_pps = (tot_fwd_pkts / duration) if duration > 0 else 0.0
         bwd_pps = (tot_bwd_pkts / duration) if duration > 0 else 0.0
 
-        # Subflow averages
         def subflow_avg(pkts):
             if not pkts: return (0.0, 0.0)
             t_sorted = sorted(pkts, key=lambda x: x.ts)
@@ -517,15 +561,11 @@ class InSDNFullApp(app_manager.RyuApp):
                 else:
                     subflows.append(cur); cur = [p]
             subflows.append(cur)
-            return (
-                safe_mean([len(s) for s in subflows]),
-                safe_mean([sum(x.length for x in s) for s in subflows])
-            )
+            return (safe_mean([len(s) for s in subflows]), safe_mean([sum(x.length for x in s) for s in subflows]))
 
         sf_fwd_pkts_avg, sf_fwd_bytes_avg = subflow_avg(fwd)
         sf_bwd_pkts_avg, sf_bwd_bytes_avg = subflow_avg(bwd)
 
-        # TTL & unique ports
         ttl_vals = bucket.ttl_vals
         ttl_avg = safe_mean(ttl_vals) if ttl_vals else 0
         ttl_min = min(ttl_vals) if ttl_vals else 0
@@ -533,16 +573,13 @@ class InSDNFullApp(app_manager.RyuApp):
         uniq_src_ports = len(bucket.src_ports)
         uniq_dst_ports = len(bucket.dst_ports)
 
-        # First payload bytes
         first_payload = 0
         if bucket.packets:
             p0 = bucket.packets[0]
             first_payload = max(0, p0.length - (p0.eth_hdr_len + p0.ip_hdr_len + p0.l4_hdr_len))
 
-        # Label
         label = read_label_file()
 
-        # Assemble row
         row = [
             f"{src_ip}-{dst_ip}-{src_port}-{dst_port}-{proto}-{int(start_ts)}",
             src_ip, src_port, dst_ip, dst_port, proto, start_ts,
@@ -557,39 +594,27 @@ class InSDNFullApp(app_manager.RyuApp):
             Bwd_IAT_Tot, Bwd_IAT_Min, Bwd_IAT_Mean, Bwd_IAT_Max, Bwd_IAT_Std,
             A_min, A_mean, A_max, A_std,
             I_min, I_mean, I_max, I_std,
-            # directional PSH/URG
             fwd_flags.get('PSH', 0), bwd_flags.get('PSH', 0),
             fwd_flags.get('URG', 0), bwd_flags.get('URG', 0),
-            # total flags
             tot_flags.get('FIN', 0), tot_flags.get('SYN', 0), tot_flags.get('RST', 0),
             tot_flags.get('PSH', 0), tot_flags.get('ACK', 0), tot_flags.get('URG', 0),
             tot_flags.get('CWR', 0), tot_flags.get('ECE', 0),
-            # behaviours
             down_up_ratio, fwd_seg_avg, bwd_seg_avg,
-            # bulk
             Fwd_Bulk_Byts_Avg, Fwd_Bulk_Pkts_Avg, Fwd_Bulk_Rate_Avg,
             Bwd_Bulk_Byts_Avg, Bwd_Bulk_Pkts_Avg, Bwd_Bulk_Rate_Avg,
-            # init windows
             init_fwd, init_bwd,
-            # fwd active data & min seg
             fwd_act_data_pkts, fwd_seg_min,
-            # rates
             flow_bps, flow_pps, fwd_pps, bwd_pps,
-            # subflows
             sf_fwd_pkts_avg, sf_fwd_bytes_avg, sf_bwd_pkts_avg, sf_bwd_bytes_avg,
-            # extras
             ttl_avg, ttl_min, ttl_max, uniq_src_ports, uniq_dst_ports,
             P_mode, P_median, first_payload,
-            # label
             label
         ]
 
-        # Final safety check
         if len(row) != len(HEADERS):
             self.logger.warning("Header length mismatch: headers=%d row=%d", len(HEADERS), len(row))
         return row
 
-    # -------- cleanup --------
     def close(self):
         try:
             self.csv_fh.close()
