@@ -39,7 +39,6 @@ from ryu.lib.packet import packet, ethernet, ipv4
 API_URL = os.getenv("INSND_API_URL", "http://127.0.0.1:8000/predict-row")
 SEND_TO_API = os.getenv("INSND_SEND_TO_API", "1") == "1"
 API_TIMEOUT = float(os.getenv("INSND_API_TIMEOUT", "0.5"))  # seconds
-
 # ----------------- IDS CONFIG -----------------
 CSV_OUT = '/tmp/insdn_features.csv'
 PACKET_CACHE_TTL = 4.0
@@ -368,39 +367,53 @@ class InSDNFullApp(app_manager.RyuApp):
             out[model_name] = to_number(ryu_row.get(ryu_name, 0))
         return out
 
-    def _build_api_payload(self, row):
-        ryu_row = self._row_to_dict(row)
-        model_row = self._build_model_12(ryu_row)
-        payload = {
-            "flow_id": ryu_row.get("FlowID"),
-            "start_time": ryu_row.get("StartTime"),
-            "meta": {
-                "src_ip": ryu_row.get("SrcIP"),
-                "dst_ip": ryu_row.get("DstIP"),
-                "src_port": ryu_row.get("SrcPort"),
-                "dst_port": ryu_row.get("DstPort"),
-                "protocol": ryu_row.get("Protocol"),
-            },
-            "ryu_row": ryu_row,
-            "model_row": model_row,
-            "model_columns": MODEL_COLUMNS,
-        }
-        return payload
+    # In ryu_insdn_full.py, modify _build_api_payload to include packets:
+def _build_api_payload(self, row):
+    ryu_row = self._row_to_dict(row)
+    model_row = self._build_model_12(ryu_row)
+    payload = {
+        "flow_id": ryu_row.get("FlowID"),
+        "start_time": ryu_row.get("StartTime"),
+        "meta": {
+            "src_ip": ryu_row.get("SrcIP"),
+            "dst_ip": ryu_row.get("DstIP"),
+            "src_port": ryu_row.get("SrcPort"),
+            "dst_port": ryu_row.get("DstPort"),
+            "protocol": ryu_row.get("Protocol"),
+        },
+        "packets": [{
+            "src_ip": ryu_row.get("SrcIP"),
+            "dst_ip": ryu_row.get("DstIP"),
+            "protocol": ryu_row.get("Protocol"),
+            "length": p.length,  # You'll need to include packet lengths
+            "direction": p.dir   # And directions from your PacketRec
+        } for p in bucket.packets[-10:]],  # Include last 10 packets
+        "ryu_row": ryu_row,
+        "model_row": model_row,
+        "model_columns": MODEL_COLUMNS,
+    }
+    return payload
 
     def _post_row_async(self, payload: dict):
-        # lazy import to avoid import-time SSL/urllib3 problems inside ryu-manager
+        """Non-blocking HTTP POST with short timeout.
+
+        We import requests lazily to avoid import-time SSL recursion problems
+        seen in some environments when ryu-manager imports modules.
+        """
         try:
-            import requests
-        except Exception as e:
-            self.logger.debug("requests import failed (skipping API post): %s", e)
-            return
-        try:
+            try:
+                import requests
+            except Exception as e:
+                # If requests can't be imported, quietly drop (controller should not crash)
+                self.logger.debug("requests import failed: %s", e)
+                return
+            # Post JSON
             r = requests.post(API_URL, json=payload, timeout=API_TIMEOUT)
             if r.status_code >= 300:
                 self.logger.warning("API %s returned %s: %s", API_URL, r.status_code, r.text[:200])
         except Exception as e:
+            # swallow exceptions to avoid impacting controller
             self.logger.debug("API post failed: %s", e)
-
     # ------------- feature computation (unchanged logic) --------------
     def _compute_features_row(self, key, bucket: FlowBucket):
         (src_ip, dst_ip, src_port, dst_port, proto) = key
