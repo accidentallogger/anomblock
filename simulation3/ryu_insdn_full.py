@@ -11,7 +11,7 @@ ryu_insdn_full.py (complete, API-enabled)
 - Posts every finalized flow to an HTTP API in non-blocking fashion (optional)
 
 ENV:
-  INSND_SEND_TO_API=1|0                 # enable/disable API posts (default 1)
+  INSND_SEND_TO_API=1|0                 # enable/disable API posts (default 0)
   INSND_API_URL=http://127.0.0.1:8000/predict-row
   INSND_API_TIMEOUT=0.5                 # seconds
 """
@@ -37,8 +37,10 @@ from ryu.lib.packet import packet, ethernet, ipv4
 
 # ----------------- API CONFIG -----------------
 API_URL = os.getenv("INSND_API_URL", "http://127.0.0.1:8000/predict-row")
-SEND_TO_API = os.getenv("INSND_SEND_TO_API", "1") == "1"
+# default changed to "0" so we only write CSV unless you opt-in
+SEND_TO_API = os.getenv("INSND_SEND_TO_API", "0") == "1"
 API_TIMEOUT = float(os.getenv("INSND_API_TIMEOUT", "0.5"))  # seconds
+
 # ----------------- IDS CONFIG -----------------
 CSV_OUT = '/tmp/insdn_features.csv'
 PACKET_CACHE_TTL = 4.0
@@ -122,6 +124,8 @@ PacketRec = namedtuple('PacketRec', [
 def safe_mean(xs): return statistics.mean(xs) if xs else 0.0
 def safe_std(xs): return statistics.pstdev(xs) if len(xs) > 1 else 0.0
 def safe_var(xs): return statistics.pvariance(xs) if len(xs) > 1 else 0.0
+def safe_min(xs): return min(xs) if xs else 0.0
+def safe_max(xs): return max(xs) if xs else 0.0
 
 def read_label_file():
     try:
@@ -147,6 +151,43 @@ class FlowBucket:
 
 class InSDNFullApp(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def _build_api_payload(self, row, bucket):
+        # row -> Ryu row dict
+        ryu_row = self._row_to_dict(row)
+        model_row = self._build_model_12(ryu_row)
+
+        # include last few packets for dashboards
+        last_pkts = []
+        try:
+            for p in bucket.packets[-10:]:
+                last_pkts.append({
+                    "timestamp": p.ts,
+                    "src_ip": ryu_row.get("SrcIP"),
+                    "dst_ip": ryu_row.get("DstIP"),
+                    "protocol": ryu_row.get("Protocol"),
+                    "length": int(p.length),
+                    "direction": p.dir,
+                })
+        except Exception:
+            last_pkts = []
+
+        payload = {
+            "flow_id": ryu_row.get("FlowID"),
+            "start_time": float(ryu_row.get("StartTime") or 0.0),
+            "meta": {
+                "src_ip": ryu_row.get("SrcIP"),
+                "dst_ip": ryu_row.get("DstIP"),
+                "src_port": ryu_row.get("SrcPort"),
+                "dst_port": ryu_row.get("DstPort"),
+                "protocol": ryu_row.get("Protocol"),
+            },
+            "packets": last_pkts,
+            "ryu_row": ryu_row,
+            "model_row": model_row,
+            "model_columns": MODEL_COLUMNS,
+        }
+        return payload
 
     def __init__(self, *args, **kwargs):
         super(InSDNFullApp, self).__init__(*args, **kwargs)
@@ -329,8 +370,7 @@ class InSDNFullApp(app_manager.RyuApp):
                     row = self._compute_features_row(key, bucket)
                     self._write_row(row)
                     if SEND_TO_API:
-                        payload = self._build_api_payload(row)
-                        # spawn an async task to POST (import requests lazily)
+                        payload = self._build_api_payload(row, bucket)
                         hub.spawn(self._post_row_async, payload)
                     self.logger.info(
                         "WROTE flow %s label=%s pkts=%d bytes=%d",
@@ -367,269 +407,267 @@ class InSDNFullApp(app_manager.RyuApp):
             out[model_name] = to_number(ryu_row.get(ryu_name, 0))
         return out
 
-    # In ryu_insdn_full.py, modify _build_api_payload to include packets:
-def _build_api_payload(self, row):
-    ryu_row = self._row_to_dict(row)
-    model_row = self._build_model_12(ryu_row)
-    payload = {
-        "flow_id": ryu_row.get("FlowID"),
-        "start_time": ryu_row.get("StartTime"),
-        "meta": {
-            "src_ip": ryu_row.get("SrcIP"),
-            "dst_ip": ryu_row.get("DstIP"),
-            "src_port": ryu_row.get("SrcPort"),
-            "dst_port": ryu_row.get("DstPort"),
-            "protocol": ryu_row.get("Protocol"),
-        },
-        "packets": [{
-            "src_ip": ryu_row.get("SrcIP"),
-            "dst_ip": ryu_row.get("DstIP"),
-            "protocol": ryu_row.get("Protocol"),
-            "length": p.length,  # You'll need to include packet lengths
-            "direction": p.dir   # And directions from your PacketRec
-        } for p in bucket.packets[-10:]],  # Include last 10 packets
-        "ryu_row": ryu_row,
-        "model_row": model_row,
-        "model_columns": MODEL_COLUMNS,
-    }
-    return payload
-
-    def _post_row_async(self, payload: dict):
-        """Non-blocking HTTP POST with short timeout.
-
-        We import requests lazily to avoid import-time SSL recursion problems
-        seen in some environments when ryu-manager imports modules.
-        """
-        try:
-            try:
-                import requests
-            except Exception as e:
-                # If requests can't be imported, quietly drop (controller should not crash)
-                self.logger.debug("requests import failed: %s", e)
-                return
-            # Post JSON
-            r = requests.post(API_URL, json=payload, timeout=API_TIMEOUT)
-            if r.status_code >= 300:
-                self.logger.warning("API %s returned %s: %s", API_URL, r.status_code, r.text[:200])
-        except Exception as e:
-            # swallow exceptions to avoid impacting controller
-            self.logger.debug("API post failed: %s", e)
-    # ------------- feature computation (unchanged logic) --------------
-    def _compute_features_row(self, key, bucket: FlowBucket):
+    # ----------------- NEW: feature computation -----------------
+    def _compute_features_row(self, key, bucket):
         (src_ip, dst_ip, src_port, dst_port, proto) = key
-        start_ts = bucket.first_ts or 0.0
-        duration = (bucket.last_ts - bucket.first_ts) if (bucket.first_ts and bucket.last_ts) else 0.0
-        fwd = [p for p in bucket.packets if p.dir == 'fwd']
-        bwd = [p for p in bucket.packets if p.dir == 'bwd']
+        pkts = list(bucket.packets)
+        if not pkts:
+            return [0] * len(HEADERS)
 
-        fwd_hdr_len = int(bucket.fwd_header_bytes / bucket.fwd_hdr_cnt) if bucket.fwd_hdr_cnt else 0
-        bwd_hdr_len = int(bucket.bwd_header_bytes / bucket.bwd_hdr_cnt) if bucket.bwd_hdr_cnt else 0
+        start_ts = bucket.first_ts or pkts[0].ts
+        end_ts = bucket.last_ts or pkts[-1].ts
+        duration = max(1e-6, end_ts - start_ts)
 
-        tot_fwd_pkts = len(fwd); tot_bwd_pkts = len(bwd)
-        tot_fwd_bytes = sum(p.length for p in fwd); tot_bwd_bytes = sum(p.length for p in bwd)
-
+        # per-dir lists
+        fwd = [p for p in pkts if p.dir == 'fwd']
+        bwd = [p for p in pkts if p.dir == 'bwd']
         fwd_lens = [p.length for p in fwd]
         bwd_lens = [p.length for p in bwd]
-        all_lens = [p.length for p in bucket.packets]
+        all_lens = [p.length for p in pkts]
 
-        F_fwd_min = min(fwd_lens) if fwd_lens else 0
-        F_fwd_mean = safe_mean(fwd_lens)
-        F_fwd_max = max(fwd_lens) if fwd_lens else 0
-        F_fwd_std = safe_std(fwd_lens)
-        B_bwd_min = min(bwd_lens) if bwd_lens else 0
-        B_bwd_mean = safe_mean(bwd_lens)
-        B_bwd_max = max(bwd_lens) if bwd_lens else 0
-        B_bwd_std = safe_std(bwd_lens)
+        # IATs
+        def iats(seq):
+            if len(seq) < 2:
+                return []
+            seq_sorted = sorted(seq, key=lambda x: x.ts)
+            return [seq_sorted[i].ts - seq_sorted[i-1].ts for i in range(1, len(seq_sorted))]
 
-        P_min = min(all_lens) if all_lens else 0
-        P_mean = safe_mean(all_lens)
-        P_max = max(all_lens) if all_lens else 0
-        P_var = safe_var(all_lens)
-        P_std = safe_std(all_lens)
-        P_median = statistics.median(all_lens) if all_lens else 0
-        P_mode = bucket.size_counter.most_common(1)[0][0] if bucket.size_counter else 0
+        all_iats = iats(pkts)
+        fwd_iats = iats(fwd)
+        bwd_iats = iats(bwd)
 
-        def iat_series(pkts):
-            if len(pkts) < 2: return []
-            times = [p.ts for p in sorted(pkts, key=lambda x: x.ts)]
-            return [t2 - t1 for t1, t2 in zip(times[:-1], times[1:])]
+        # Active/Idle using SUBFLOW_GAP on overall IATs
+        active_periods = []
+        idle_gaps = []
+        if pkts:
+            # derive periods
+            last_ts = pkts[0].ts
+            cur_active_start = last_ts
+            for p in sorted(pkts, key=lambda x: x.ts)[1:]:
+                gap = p.ts - last_ts
+                if gap > SUBFLOW_GAP:
+                    # active segment closed at last_ts
+                    active_periods.append(max(0.0, last_ts - cur_active_start))
+                    idle_gaps.append(gap)
+                    cur_active_start = p.ts
+                last_ts = p.ts
+            # close last active segment
+            active_periods.append(max(0.0, last_ts - cur_active_start))
 
-        flow_iats = iat_series(bucket.packets)
-        Flow_IAT_Min = min(flow_iats) if flow_iats else 0.0
-        Flow_IAT_Mean = safe_mean(flow_iats) if flow_iats else 0.0
-        Flow_IAT_Max = max(flow_iats) if flow_iats else 0.0
-        Flow_IAT_Std  = safe_std(flow_iats)  if len(flow_iats) > 1 else 0.0
+        # Flags counts
+        FIN, SYN, RST, PSH, ACK, URG, ECE, CWR = (0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80)
+        def flag_count(mask, seq=None):
+            seq = seq if seq is not None else pkts
+            return sum(1 for p in seq if (p.tcp_flags & mask) != 0)
 
-        fwd_iats = iat_series(fwd)
-        bwd_iats = iat_series(bwd)
-        Fwd_IAT_Tot = sum(fwd_iats) if fwd_iats else 0.0
-        Fwd_IAT_Min = min(fwd_iats) if fwd_iats else 0.0
-        Fwd_IAT_Mean = safe_mean(fwd_iats) if fwd_iats else 0.0
-        Fwd_IAT_Max = max(fwd_iats) if fwd_iats else 0.0
-        Fwd_IAT_Std = safe_std(fwd_iats) if len(fwd_iats) > 1 else 0.0
-        Bwd_IAT_Tot = sum(bwd_iats) if bwd_iats else 0.0
-        Bwd_IAT_Min = min(bwd_iats) if bwd_iats else 0.0
-        Bwd_IAT_Mean = safe_mean(bwd_iats) if bwd_iats else 0.0
-        Bwd_IAT_Max = max(bwd_iats) if bwd_iats else 0.0
-        Bwd_IAT_Std = safe_std(bwd_iats) if len(bwd_iats) > 1 else 0.0
+        fwd_psh = flag_count(PSH, fwd)
+        bwd_psh = flag_count(PSH, bwd)
+        fwd_urg = flag_count(URG, fwd)
+        bwd_urg = flag_count(URG, bwd)
 
-        def active_idle(pkts):
-            if not pkts:
-                return (0,0,0,0, 0,0,0,0)
-            times = sorted([p.ts for p in pkts])
-            intervals = []
-            s = times[0]; last = times[0]
-            for t in times[1:]:
-                if t - last <= SUBFLOW_GAP:
-                    last = t
-                else:
-                    intervals.append((s, last)); s = t; last = t
-            intervals.append((s, last))
-            act_durs = [e - s for s, e in intervals]
-            idles = [intervals[i+1][0] - intervals[i][1] for i in range(len(intervals)-1)] if len(intervals) > 1 else []
-            return (
-                min(act_durs) if act_durs else 0.0,
-                safe_mean(act_durs) if act_durs else 0.0,
-                max(act_durs) if act_durs else 0.0,
-                safe_std(act_durs) if len(act_durs) > 1 else 0.0,
-                min(idles) if idles else 0.0,
-                safe_mean(idles) if idles else 0.0,
-                max(idles) if idles else 0.0,
-                safe_std(idles) if len(idles) > 1 else 0.0
-            )
+        fin_cnt = flag_count(FIN)
+        syn_cnt = flag_count(SYN)
+        rst_cnt = flag_count(RST)
+        psh_cnt = flag_count(PSH)
+        ack_cnt = flag_count(ACK)
+        urg_cnt = flag_count(URG)
+        cwr_cnt = flag_count(CWR)
+        ece_cnt = flag_count(ECE)
 
-        A_min, A_mean, A_max, A_std, I_min, I_mean, I_max, I_std = active_idle(bucket.packets)
-
-        def count_flags(pkts):
-            SYN=ACK=FIN=RST=PSH=URG=CWR=ECE=0
-            for p in pkts:
-                f = p.tcp_flags
-                if f & 0x02: SYN += 1
-                if f & 0x10: ACK += 1
-                if f & 0x01: FIN += 1
-                if f & 0x04: RST += 1
-                if f & 0x08: PSH += 1
-                if f & 0x20: URG += 1
-                if f & 0x80: CWR += 1
-                if f & 0x40: ECE += 1
-            return dict(SYN=SYN, ACK=ACK, FIN=FIN, RST=RST, PSH=PSH, URG=URG, CWR=CWR, ECE=ECE)
-
-        fwd_flags = count_flags(fwd)
-        bwd_flags = count_flags(bwd)
-        tot_flags = count_flags(bucket.packets)
-
-        down_up_ratio = (tot_bwd_bytes / tot_fwd_bytes) if tot_fwd_bytes > 0 else (float(tot_bwd_bytes) if tot_bwd_bytes > 0 else 0.0)
-        fwd_seg_avg = safe_mean(fwd_lens) if fwd_lens else 0.0
-        bwd_seg_avg = safe_mean(bwd_lens) if bwd_lens else 0.0
-
-        def compute_bulk(pkts):
-            if not pkts: return (0.0, 0.0, 0.0)
-            bulks = []; cur = []
-            for p in sorted(pkts, key=lambda x: x.ts):
-                if p.length >= BULK_PKT_SIZE:
-                    if not cur:
-                        cur = [p]
-                    else:
-                        if p.ts - cur[-1].ts <= BULK_IAT:
-                            cur.append(p)
-                        else:
-                            bulks.append(cur); cur = [p]
-                else:
-                    if cur:
-                        bulks.append(cur); cur = []
-            if cur: bulks.append(cur)
-            if not bulks: return (0.0, 0.0, 0.0)
-            bytes_per_bulk = [sum(pp.length for pp in b) for b in bulks]
-            pkts_per_bulk = [len(b) for b in bulks]
-            rates = []
-            for b in bulks:
-                d = b[-1].ts - b[0].ts
-                d = d if d > 0 else 1e-6
-                rates.append(sum(pp.length for pp in b) / d)
-            return (safe_mean(bytes_per_bulk), safe_mean(pkts_per_bulk), safe_mean(rates))
-
-        Fwd_Bulk_Byts_Avg, Fwd_Bulk_Pkts_Avg, Fwd_Bulk_Rate_Avg = compute_bulk(fwd)
-        Bwd_Bulk_Byts_Avg, Bwd_Bulk_Pkts_Avg, Bwd_Bulk_Rate_Avg = compute_bulk(bwd)
-
-        init_fwd = sum(p.length for p in sorted(fwd, key=lambda x: x.ts)[:INITIAL_WINDOW_PKTS])
-        init_bwd = sum(p.length for p in sorted(bwd, key=lambda x: x.ts)[:INITIAL_WINDOW_PKTS])
-
-        fwd_act_data_pkts = sum(
-            1 for p in fwd if p.length > (p.eth_hdr_len + p.ip_hdr_len + p.l4_hdr_len)
-        )
-        fwd_seg_min = min(fwd_lens) if fwd_lens else 0
-
-        flow_bps = (bucket.total_bytes / duration) if duration > 0 else 0.0
-        flow_pps = (bucket.total_pkts / duration) if duration > 0 else 0.0
-        fwd_pps = (tot_fwd_pkts / duration) if duration > 0 else 0.0
-        bwd_pps = (tot_bwd_pkts / duration) if duration > 0 else 0.0
-
-        def subflow_avg(pkts):
-            if not pkts: return (0.0, 0.0)
-            t_sorted = sorted(pkts, key=lambda x: x.ts)
-            subflows = []; cur = [t_sorted[0]]
-            for p in t_sorted[1:]:
-                if p.ts - cur[-1].ts <= SUBFLOW_GAP:
+        # Bulk (simplified): packets >= BULK_PKT_SIZE with IAT <= BULK_IAT (window)
+        def bulk_stats(seq):
+            if not seq:
+                return (0.0, 0.0, 0.0)  # bytes_avg, pkts_avg, rate_avg
+            seq_sorted = sorted(seq, key=lambda x: x.ts)
+            groups = []
+            cur = [seq_sorted[0]]
+            for p in seq_sorted[1:]:
+                if (p.ts - cur[-1].ts) <= BULK_IAT:
                     cur.append(p)
                 else:
-                    subflows.append(cur); cur = [p]
+                    groups.append(cur)
+                    cur = [p]
+            groups.append(cur)
+            # consider only packets meeting size threshold
+            groups = [[p for p in g if p.length >= BULK_PKT_SIZE] for g in groups]
+            groups = [g for g in groups if g]  # drop empties
+
+            if not groups:
+                return (0.0, 0.0, 0.0)
+            bytes_per_group = [sum(p.length for p in g) for g in groups]
+            pkts_per_group = [len(g) for g in groups]
+            # rate per group (pkts/sec over group's span, min 1e-6)
+            rate_per_group = []
+            for g in groups:
+                span = max(1e-6, g[-1].ts - g[0].ts)
+                rate_per_group.append(len(g)/span)
+            return (
+                safe_mean(bytes_per_group),
+                safe_mean(pkts_per_group),
+                safe_mean(rate_per_group),
+            )
+
+        fwd_bytes = sum(fwd_lens)
+        bwd_bytes = sum(bwd_lens)
+        tot_bytes = fwd_bytes + bwd_bytes
+        tot_pkts = len(pkts)
+        tot_fwd = len(fwd)
+        tot_bwd = len(bwd)
+
+        fwd_bulk_b, fwd_bulk_p, fwd_bulk_r = bulk_stats(fwd)
+        bwd_bulk_b, bwd_bulk_p, bwd_bulk_r = bulk_stats(bwd)
+
+        # Seg size avg ~ mean pkt length per direction
+        fwd_seg_avg = safe_mean(fwd_lens)
+        bwd_seg_avg = safe_mean(bwd_lens)
+
+        # Subflows (overall, split by SUBFLOW_GAP)
+        subflows = []
+        if pkts:
+            ssorted = sorted(pkts, key=lambda x: x.ts)
+            cur = [ssorted[0]]
+            for p in ssorted[1:]:
+                if (p.ts - cur[-1].ts) > SUBFLOW_GAP:
+                    subflows.append(cur)
+                    cur = [p]
+                else:
+                    cur.append(p)
             subflows.append(cur)
-            return (safe_mean([len(s) for s in subflows]), safe_mean([sum(x.length for x in s) for s in subflows]))
 
-        sf_fwd_pkts_avg, sf_fwd_bytes_avg = subflow_avg(fwd)
-        sf_bwd_pkts_avg, sf_bwd_bytes_avg = subflow_avg(bwd)
+        def subflow_dir_avgs(direction):
+            if not subflows:
+                return (0.0, 0.0)
+            pkts_avgs = []
+            bytes_avgs = []
+            for sf in subflows:
+                dseq = [p for p in sf if p.dir == direction]
+                pkts_avgs.append(len(dseq))
+                bytes_avgs.append(sum(p.length for p in dseq))
+            return (safe_mean(pkts_avgs), safe_mean(bytes_avgs))
 
-        ttl_vals = bucket.ttl_vals
-        ttl_avg = safe_mean(ttl_vals) if ttl_vals else 0
-        ttl_min = min(ttl_vals) if ttl_vals else 0
-        ttl_max = max(ttl_vals) if ttl_vals else 0
+        sub_fwd_pkts_avg, sub_fwd_bytes_avg = subflow_dir_avgs('fwd')
+        sub_bwd_pkts_avg, sub_bwd_bytes_avg = subflow_dir_avgs('bwd')
+
+        # Flow/s rates
+        flow_bytes_per_s = tot_bytes / duration
+        flow_pkts_per_s = tot_pkts / duration
+        fwd_pkts_per_s = tot_fwd / duration
+        bwd_pkts_per_s = tot_bwd / duration
+
+        # IAT aggregates (overall + per-dir)
+        def iat_stats(iat_list):
+            return (
+                safe_min(iat_list),
+                safe_mean(iat_list),
+                safe_max(iat_list),
+                safe_std(iat_list),
+                sum(iat_list) if iat_list else 0.0
+            )
+        all_min, all_mean, all_max, all_std, _ = iat_stats(all_iats)
+        f_min, f_mean, f_max, f_std, f_tot = iat_stats(fwd_iats)
+        b_min, b_mean, b_max, b_std, b_tot = iat_stats(bwd_iats)
+
+        # Packet length stats
+        fwd_min = safe_min(fwd_lens); fwd_max = safe_max(fwd_lens)
+        fwd_mean = safe_mean(fwd_lens); fwd_std = safe_std(fwd_lens)
+        bwd_min = safe_min(bwd_lens); bwd_max = safe_max(bwd_lens)
+        bwd_mean = safe_mean(bwd_lens); bwd_std = safe_std(bwd_lens)
+        all_min_len = safe_min(all_lens)
+        all_max_len = safe_max(all_lens)
+        all_mean_len = safe_mean(all_lens)
+        all_var_len = safe_var(all_lens)
+        all_std_len = (all_var_len ** 0.5) if all_var_len > 0 else 0.0
+
+        # Header lengths (store totals to be conservative)
+        fwd_header_len_total = bucket.fwd_header_bytes
+        bwd_header_len_total = bucket.bwd_header_bytes
+
+        # Down/Up ratio (CIC uses pkt counts)
+        down_up_ratio = (tot_bwd / max(1, tot_fwd))
+
+        # Init window bytes (not parsed here) -> 0
+        init_fwd_win = 0
+        init_bwd_win = 0
+
+        # Fwd active data pkts (payload > 0)
+        def payload_len(p):
+            return max(0, p.length - (p.eth_hdr_len + p.ip_hdr_len + p.l4_hdr_len))
+        fwd_act_data_pkts = sum(1 for p in fwd if payload_len(p) > 0)
+        fwd_seg_size_min = fwd_min
+
+        # TTL stats
+        ttl_avg = safe_mean(bucket.ttl_vals)
+        ttl_min = safe_min(bucket.ttl_vals)
+        ttl_max = safe_max(bucket.ttl_vals)
+
+        # Unique ports
         uniq_src_ports = len(bucket.src_ports)
         uniq_dst_ports = len(bucket.dst_ports)
 
-        first_payload = 0
-        if bucket.packets:
-            p0 = bucket.packets[0]
-            first_payload = max(0, p0.length - (p0.eth_hdr_len + p0.ip_hdr_len + p0.l4_hdr_len))
+        # Mode & Median of packet sizes
+        ps_mode = 0
+        if bucket.size_counter:
+            ps_mode = bucket.size_counter.most_common(1)[0][0]
+        ps_median = 0.0
+        if all_lens:
+            sl = sorted(all_lens)
+            n = len(sl)
+            mid = n // 2
+            if n % 2 == 1:
+                ps_median = float(sl[mid])
+            else:
+                ps_median = (sl[mid-1] + sl[mid]) / 2.0
 
+        # First_Payload_Bytes (first packet with payload > 0)
+        first_payload_bytes = 0
+        for p in pkts:
+            pl = payload_len(p)
+            if pl > 0:
+                first_payload_bytes = pl
+                break
+
+        # Build FlowID
+        fid = f"{src_ip}-{src_port}-{dst_ip}-{dst_port}-{proto}-{int(start_ts*1000)}"
+
+        # Label
         label = read_label_file()
 
+        # Assemble row strictly in HEADERS order
         row = [
-            f"{src_ip}-{dst_ip}-{src_port}-{dst_port}-{proto}-{int(start_ts)}",
-            src_ip, src_port, dst_ip, dst_port, proto, start_ts,
-            fwd_hdr_len, bwd_hdr_len,
-            tot_fwd_pkts, tot_bwd_pkts, tot_fwd_bytes, tot_bwd_bytes,
-            F_fwd_min, F_fwd_mean, F_fwd_max, F_fwd_std,
-            B_bwd_min, B_bwd_mean, B_bwd_max, B_bwd_std,
-            P_min, P_mean, P_max, P_var, P_std,
+            fid, src_ip, src_port, dst_ip, dst_port, proto, start_ts,
+            fwd_header_len_total, bwd_header_len_total,
+            tot_fwd, tot_bwd, fwd_bytes, bwd_bytes,
+            fwd_min, fwd_mean, fwd_max, fwd_std,
+            bwd_min, bwd_mean, bwd_max, bwd_std,
+            all_min_len, all_mean_len, all_max_len, all_var_len, all_std_len,
             duration,
-            Flow_IAT_Min, Flow_IAT_Mean, Flow_IAT_Max, Flow_IAT_Std,
-            Fwd_IAT_Tot, Fwd_IAT_Min, Fwd_IAT_Mean, Fwd_IAT_Max, Fwd_IAT_Std,
-            Bwd_IAT_Tot, Bwd_IAT_Min, Bwd_IAT_Mean, Bwd_IAT_Max, Bwd_IAT_Std,
-            A_min, A_mean, A_max, A_std,
-            I_min, I_mean, I_max, I_std,
-            fwd_flags.get('PSH', 0), bwd_flags.get('PSH', 0),
-            fwd_flags.get('URG', 0), bwd_flags.get('URG', 0),
-            tot_flags.get('FIN', 0), tot_flags.get('SYN', 0), tot_flags.get('RST', 0),
-            tot_flags.get('PSH', 0), tot_flags.get('ACK', 0), tot_flags.get('URG', 0),
-            tot_flags.get('CWR', 0), tot_flags.get('ECE', 0),
+            all_min, all_mean, all_max, all_std,
+            f_tot, f_min, f_mean, f_max, f_std,
+            b_tot, b_min, b_mean, b_max, b_std,
+            safe_min(active_periods), safe_mean(active_periods), safe_max(active_periods), safe_std(active_periods),
+            safe_min(idle_gaps), safe_mean(idle_gaps), safe_max(idle_gaps), safe_std(idle_gaps),
+            fwd_psh, bwd_psh, fwd_urg, bwd_urg,
+            fin_cnt, syn_cnt, rst_cnt, psh_cnt, ack_cnt, urg_cnt, cwr_cnt, ece_cnt,
             down_up_ratio, fwd_seg_avg, bwd_seg_avg,
-            Fwd_Bulk_Byts_Avg, Fwd_Bulk_Pkts_Avg, Fwd_Bulk_Rate_Avg,
-            Bwd_Bulk_Byts_Avg, Bwd_Bulk_Pkts_Avg, Bwd_Bulk_Rate_Avg,
-            init_fwd, init_bwd,
-            fwd_act_data_pkts, fwd_seg_min,
-            flow_bps, flow_pps, fwd_pps, bwd_pps,
-            sf_fwd_pkts_avg, sf_fwd_bytes_avg, sf_bwd_pkts_avg, sf_bwd_bytes_avg,
+            fwd_bulk_b, fwd_bulk_p, fwd_bulk_r,
+            bwd_bulk_b, bwd_bulk_p, bwd_bulk_r,
+            init_fwd_win, init_bwd_win,
+            fwd_act_data_pkts, fwd_seg_size_min,
+            flow_bytes_per_s, flow_pkts_per_s, fwd_pkts_per_s, bwd_pkts_per_s,
+            sub_fwd_pkts_avg, sub_fwd_bytes_avg, sub_bwd_pkts_avg, sub_bwd_bytes_avg,
             ttl_avg, ttl_min, ttl_max, uniq_src_ports, uniq_dst_ports,
-            P_mode, P_median, first_payload,
+            ps_mode, ps_median, first_payload_bytes,
             label
         ]
-
-        if len(row) != len(HEADERS):
-            self.logger.warning("Header length mismatch: headers=%d row=%d", len(HEADERS), len(row))
         return row
 
-    def close(self):
+    def _post_row_async(self, payload):
+        # Optional async POST; safe no-op if SEND_TO_API=0
         try:
-            self.csv_fh.close()
+            import requests
+        except Exception:
+            return
+        try:
+            requests.post(API_URL, json=payload, timeout=API_TIMEOUT)
         except Exception:
             pass

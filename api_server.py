@@ -21,6 +21,8 @@ import socket
 import struct
 import threading
 import time
+import json
+import asyncio
 from typing import Any, Dict, List, Optional
 from collections import deque
 import joblib
@@ -28,14 +30,15 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, RootModel
+from pydantic import BaseModel
 from starlette.responses import JSONResponse
 from tensorflow.keras.models import load_model
+from sse_starlette.sse import EventSourceResponse
 
 # Config (can override with env)
-MODEL_PATH = os.getenv("MODEL_PATH", "model/lstm_model.h5")
-SCALER_PATH = os.getenv("SCALER_PATH", "model/scaler.pkl")
-LABEL_ENCODER_PATH = os.getenv("LABEL_ENCODER_PATH", "model/label_encoder.pkl")
+MODEL_PATH = os.getenv("MODEL_PATH", "model2/lstm_model.h5")
+SCALER_PATH = os.getenv("SCALER_PATH", "model2/scaler.pkl")
+LABEL_ENCODER_PATH = os.getenv("LABEL_ENCODER_PATH", "model2/label_encoder.pkl")
 
 API_RECENT_MAX = int(os.getenv("API_RECENT_MAX", "500"))
 
@@ -122,8 +125,8 @@ class BatchPredictResponse(BaseModel):
     labels: List[str]
     probs: Optional[List[List[float]]] = None
 
-class AnyDict(RootModel[Dict[str, Any]]):
-    pass
+class AnyDict(BaseModel):
+    root: Dict[str, Any]
 
 # App
 app = FastAPI(title="InSDN IDS API", version="1.3")
@@ -133,23 +136,44 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
 # Prediction lock + recent store
 _pred_lock = threading.Lock()
 _recent_lock = threading.Lock()
+_sse_subscribers = []
+
+# SSE event management
+class SSEManager:
+    def __init__(self):
+        self.subscribers = []
+    
+    async def add_event(self, event_type: str, data: Dict[str, Any]):
+        for subscriber in self.subscribers:
+            await subscriber.put({"type": event_type, "data": data})
+    
+    def add_subscriber(self, queue):
+        self.subscribers.append(queue)
+    
+    def remove_subscriber(self, queue):
+        if queue in self.subscribers:
+            self.subscribers.remove(queue)
+
+sse_manager = SSEManager()
 
 @app.on_event("startup")
-def _startup():
+async def startup_event():
     # load artifacts
     try:
         app.state.model = load_model(MODEL_PATH)
+        print(f"Loaded model from {MODEL_PATH}")
     except Exception as e:
         app.state.model = None
-        app.logger = getattr(app, "logger", None)
         print(f"Warning: failed to load model: {e}")
     try:
         app.state.scaler = joblib.load(SCALER_PATH)
+        print(f"Loaded scaler from {SCALER_PATH}")
     except Exception as e:
         app.state.scaler = None
         print(f"Warning: failed to load scaler: {e}")
     try:
         app.state.label_enc = joblib.load(LABEL_ENCODER_PATH)
+        print(f"Loaded label encoder from {LABEL_ENCODER_PATH}")
     except Exception as e:
         app.state.label_enc = None
         print(f"Warning: failed to load label_encoder: {e}")
@@ -183,8 +207,25 @@ def get_packets(n: int = Query(20, gt=0, le=1000)):
         packets = list(app.state.packet_buffer)[-n:]
         return {"packets": packets}
 
+@app.get("/sse")
+async def sse_endpoint():
+    async def event_generator():
+        queue = asyncio.Queue()
+        sse_manager.add_subscriber(queue)
+        try:
+            while True:
+                event = await queue.get()
+                yield {
+                    "event": "message",
+                    "data": json.dumps(event)
+                }
+        except asyncio.CancelledError:
+            sse_manager.remove_subscriber(queue)
+    
+    return EventSourceResponse(event_generator())
+
 @app.post("/predict-row", response_model=PredictResponse)
-def predict_row(row: AnyDict, return_probs: bool = Query(False)):
+async def predict_row(row: AnyDict, return_probs: bool = Query(False)):
     try:
         r = row.root
         feat = detect_and_extract_model_row(r)
@@ -233,13 +274,25 @@ def predict_row(row: AnyDict, return_probs: bool = Query(False)):
                             "length": pkt.get("length"),
                             "direction": pkt.get("direction")
                         })
+                        # Send packet event to SSE
+                        await sse_manager.add_event("packet", {
+                            "timestamp": time.time(),
+                            "src_ip": pkt.get("src_ip"),
+                            "dst_ip": pkt.get("dst_ip"),
+                            "protocol": pkt.get("protocol"),
+                            "length": pkt.get("length"),
+                            "direction": pkt.get("direction")
+                        })
+        
+        # Send flow event to SSE
+        await sse_manager.add_event("flow", recent_item)
         
         return JSONResponse(resp)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"prediction error: {e}")
 
 @app.post("/predict-batch", response_model=BatchPredictResponse)
-def predict_batch(rows: List[AnyDict], return_probs: bool = Query(False)):
+async def predict_batch(rows: List[AnyDict], return_probs: bool = Query(False)):
     try:
         feats = [detect_and_extract_model_row(r.root) for r in rows]
         df = pd.DataFrame(feats, columns=MODEL_COLUMNS)
@@ -264,12 +317,25 @@ def predict_batch(rows: List[AnyDict], return_probs: bool = Query(False)):
                 "meta": r.root.get("meta") if isinstance(r.root.get("meta"), dict) else {}
             }
             _append_recent(recent_item)
+            
+            # Send flow event to SSE
+            await sse_manager.add_event("flow", recent_item)
+            
             # Store packets if available
             if "packets" in r.root and isinstance(r.root["packets"], list):
                 with _recent_lock:
                     for pkt in r.root["packets"]:
                         if isinstance(pkt, dict):
                             app.state.packet_buffer.append({
+                                "timestamp": time.time(),
+                                "src_ip": pkt.get("src_ip"),
+                                "dst_ip": pkt.get("dst_ip"),
+                                "protocol": pkt.get("protocol"),
+                                "length": pkt.get("length"),
+                                "direction": pkt.get("direction")
+                            })
+                            # Send packet event to SSE
+                            await sse_manager.add_event("packet", {
                                 "timestamp": time.time(),
                                 "src_ip": pkt.get("src_ip"),
                                 "dst_ip": pkt.get("dst_ip"),
@@ -310,6 +376,8 @@ async def predict_csv(file: UploadFile = File(...), return_probs: bool = Query(F
                 "meta": {}
             }
             _append_recent(recent_item)
+            # Send flow event to SSE
+            await sse_manager.add_event("flow", recent_item)
         resp = {"labels": [str(x) for x in labels]}
         if return_probs:
             resp["probs"] = probs.tolist()

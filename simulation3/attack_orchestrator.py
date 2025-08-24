@@ -17,7 +17,7 @@ Features:
 Requirements on host: mininet, hping3, iperf3, socat, nmap, python3, netcat (nc)
 
 Run:
-  sudo python3 attack_orchestrator_3tier.py --benign --attacks --cli
+  sudo python3 attack_orchestrator.py --benign --attacks --cli
 """
 
 import os
@@ -234,9 +234,22 @@ def botnet_sim(attackers, target, dur=15):
         sh(a, bot_cmd)
 
 # ---- orchestrator sequence ----
-def run_scenarios(net, with_attacks=True, dwell=DEFAULT_DWELL):
-    h1 = net.get('h1'); h3 = net.get('h3'); h4 = net.get('h4'); h5 = net.get('h5'); h6 = net.get('h6')
+def run_scenarios(net, with_attacks=True, dwell=DEFAULT_DWELL, benign_ratio=3):
+    h1 = net.get('h1'); h2 = net.get('h2'); h3 = net.get('h3')
+    h4 = net.get('h4'); h5 = net.get('h5'); h6 = net.get('h6')
     target = '10.0.2.3'  # h3 as main victim
+
+    # ---- Benign traffic first (more quantity) ----
+    info(f"*** Generating benign traffic (ratio={benign_ratio})\n")
+    for _ in range(benign_ratio):   # repeat benign N times
+        write_label(0)  # 0 = benign
+        # Example: h1↔h2, h4↔h5, h6→h3 normal traffic
+        h1.cmd(f"ping -c {max(3, dwell//2)} 10.0.2.2 &")
+        h4.cmd(f"iperf -c 10.0.2.5 -u -b 1M -t {dwell} &")
+        h6.cmd(f"curl -m {dwell} http://10.0.2.3:80 > /dev/null 2>&1 &")
+        time.sleep(dwell)
+        clear_label()
+        time.sleep(1)
 
     if not with_attacks:
         info("*** Attacks skipped (benign-only run)\n")
@@ -247,44 +260,32 @@ def run_scenarios(net, with_attacks=True, dwell=DEFAULT_DWELL):
     # 1) SYN flood (label=1)
     write_label(1)
     syn_flood(h1, target, dur=max(1, dwell-2))
-    time.sleep(dwell)
-    clear_label()
-    time.sleep(1)
+    time.sleep(dwell); clear_label(); time.sleep(1)
 
     # 2) UDP flood (label=2)
     write_label(2)
     udp_flood(h3, target, dur=max(1, dwell-2))
-    time.sleep(dwell)
-    clear_label()
-    time.sleep(1)
+    time.sleep(dwell); clear_label(); time.sleep(1)
 
     # 3) ICMP flood (label=3)
     write_label(3)
     icmp_flood(h4, target, dur=max(1, dwell-2))
-    time.sleep(dwell)
-    clear_label()
-    time.sleep(1)
+    time.sleep(dwell); clear_label(); time.sleep(1)
 
     # 4) nmap scan (label=4)
     write_label(4)
     nmap_scan(h5, target)
-    time.sleep(dwell)
-    clear_label()
-    time.sleep(1)
+    time.sleep(dwell); clear_label(); time.sleep(1)
 
     # 5) ssh brute-sim (label=5)
     write_label(5)
-    ssh_bruteforce_sim(h6, '10.0.2.3', tries=500)
-    time.sleep(dwell)
-    clear_label()
-    time.sleep(1)
+    ssh_bruteforce_sim(h6, target, tries=500)
+    time.sleep(dwell); clear_label(); time.sleep(1)
 
     # 6) botnet sim (label=6)
     write_label(6)
     botnet_sim([h1, h3, h4], target, dur=max(1, dwell-2))
-    time.sleep(dwell)
-    clear_label()
-    time.sleep(1)
+    time.sleep(dwell); clear_label(); time.sleep(1)
 
     info("*** Attack scenarios finished\n")
 
