@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 
-ryu-manager ryu_insdn_ful.py --verbose
+ryu-manager ryu_insdn_full.py --verbose
 
 ryu_insdn_full.py
 
@@ -26,7 +26,6 @@ CSV_OUT = '/tmp/insdn_features.csv'
 PACKET_CACHE_TTL = 1.5  # MUCH shorter TTL for short attacks
 FLUSH_TIMEOUT = 1.0     # Flush after 1 second of inactivity
 MIN_PACKETS_FOR_FLOW = 2  # Require fewer packets
-
 
 INSDN_FIELDS = [
     'Flow ID', 'Src IP', 'Src Port', 'Dst IP', 'Dst Port', 'Protocol',
@@ -99,7 +98,7 @@ def read_label_file():
     except Exception as e:
         print(f"💥 Critical error reading label: {e}")
         return "benign"
-            
+
 class FlowBucket:
     def __init__(self):
         self.packets = []
@@ -124,16 +123,39 @@ class InSDNFullApp(app_manager.RyuApp):
         self.mac_to_port = defaultdict(dict)
         
         os.makedirs(os.path.dirname(CSV_OUT) or '/tmp', exist_ok=True)
-        write_header = not os.path.exists(CSV_OUT)
-        self.csv_fh = open(CSV_OUT, 'a', newline='')
-        self.csv_writer = csv.writer(self.csv_fh)
-        if write_header:
-            self.csv_writer.writerow(HEADERS)
-            self.csv_fh.flush()
-
+        
+        # Initialize CSV file
+        self._init_csv_file()
+        
         self.gc = hub.spawn(self._gc_loop)
         self.flow_flusher = hub.spawn(self._flow_flusher_loop)
         self.logger.info("InSDNFullApp started with aggressive flow capture")
+
+    def _init_csv_file(self):
+        """Initialize CSV file with proper error handling"""
+        try:
+            # Close existing file if open
+            if hasattr(self, 'csv_fh'):
+                try:
+                    self.csv_fh.close()
+                except:
+                    pass
+            
+            # Open new file
+            self.csv_fh = open(CSV_OUT, 'a', newline='', buffering=1)
+            self.csv_writer = csv.writer(self.csv_fh)
+            
+            # Write header if file is empty or doesn't exist
+            if not os.path.exists(CSV_OUT) or os.path.getsize(CSV_OUT) == 0:
+                self.csv_writer.writerow(HEADERS)
+                self.csv_fh.flush()
+                os.fsync(self.csv_fh.fileno())
+                self.logger.info("📝 Created CSV file with headers")
+            else:
+                self.logger.info("📝 Using existing CSV file")
+                
+        except Exception as e:
+            self.logger.error(f"Failed to initialize CSV file: {e}")
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change(self, ev):
@@ -240,9 +262,8 @@ class InSDNFullApp(app_manager.RyuApp):
         except Exception:
             pass
 
-        # Use second granularity for better attack separation
-        # Replace minute granularity with millisecond granularity
-        millisecond_granularity = int(ts * 1000)  # Millisecond granularity
+        # Use millisecond granularity for flow keys
+        millisecond_granularity = int(ts * 1000)
         key = (src_ip, dst_ip, src_port, dst_port, proto, millisecond_granularity // 100)  # Group by 100ms
         plen = len(data)
 
@@ -276,25 +297,26 @@ class InSDNFullApp(app_manager.RyuApp):
             to_flush = []
             with self.lock:
                 for key, bucket in list(self.flows.items()):
-                    # Flush ANY flow that's been idle for 1 second OR has packets and is 0.3s old
+                    # FLUSH ANY flow that's been idle for 0.5 seconds OR has packets
                     if (bucket.last_ts and 
-                        ((now - bucket.last_ts > FLUSH_TIMEOUT) or 
-                        (len(bucket.packets) >= 1 and now - bucket.last_ts > 0.3))):
+                        ((now - bucket.last_ts > 0.5) or  # Reduced from 1.0 to 0.5
+                        (len(bucket.packets) >= 1 and now - bucket.last_ts > 0.2))):
                         to_flush.append((key, bucket))
                         del self.flows[key]
         
             for key, bucket in to_flush:
                 try:
-                    if bucket.packets:  # Write ANY flow with packets
+                    if bucket.packets:
                         row = self._compute_features_row(key, bucket)
-                        self._write_row(row)
-                        self.logger.info(
-                            "CAPTURED %s:%d->%s:%d proto=%d label=%s pkts=%d",
-                            key[0], key[2], key[1], key[3], key[4], row[-1], len(bucket.packets)
-                        )
+                        if row:  # Only write if we got a valid row
+                            self._write_row(row)
+                            self.logger.info(
+                                "CAPTURED %s:%d->%s:%d proto=%d label=%s pkts=%d",
+                                key[0], key[2], key[1], key[3], key[4], row[-1], len(bucket.packets)
+                            )
                 except Exception as e:
                     self.logger.exception("Error finalizing flow %s: %s", key, e)
-            hub.sleep(0.3)  # Check every 300ms (was 0.5s)
+            hub.sleep(0.2)  # Reduced from 0.3 to 0.2 seconds
 
     def _gc_loop(self):
         """Clean up very old flows"""
@@ -307,23 +329,31 @@ class InSDNFullApp(app_manager.RyuApp):
             hub.sleep(5.0)
 
     def _write_row(self, row):
-        if len(row) != len(HEADERS):
-            self.logger.error("Row length mismatch: expected %d, got %d", len(HEADERS), len(row))
-            if len(row) < len(HEADERS):
-                row = row + [0] * (len(HEADERS) - len(row))
-            else:
-                row = row[:len(HEADERS)]
         try:
+            current_size = os.path.getsize(CSV_OUT) if os.path.exists(CSV_OUT) else 0
+            self.logger.info("📝 Writing flow to CSV (current size: %d bytes)", current_size)
+            
             self.csv_writer.writerow(row)
             self.csv_fh.flush()
+            os.fsync(self.csv_fh.fileno())
+            
+            new_size = os.path.getsize(CSV_OUT)
+            self.logger.info("✅ Wrote flow to CSV (new size: %d bytes, added: %d bytes)", 
+                            new_size, new_size - current_size)
+            
         except Exception as e:
             self.logger.exception("CSV write failed: %s", e)
+            # Try to reinitialize the file
+            try:
+                self._init_csv_file()
+            except:
+                pass
 
-    def _compute_features_row(self, key, bucket):
+    def _compute_features_row(self, key, bucket):  # FIXED: Proper indentation starts here
         (src_ip, dst_ip, src_port, dst_port, proto, _) = key
         pkts = list(bucket.packets)
         if not pkts:
-            return [0] * len(HEADERS)
+            return None
 
         start_ts = bucket.first_ts or pkts[0].ts
         end_ts = bucket.last_ts or pkts[-1].ts
