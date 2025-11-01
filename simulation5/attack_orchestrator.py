@@ -5,6 +5,8 @@ watch -n 0.5 'echo -n "$(date): "; cat /tmp/current_label'
 
 attack_orchestrator.py
 
+sudo python3 attack_orchestrator.py --benign-only
+
 3-tier Mininet topology with mixed benign and attack traffic for all attack types.
 Fixed version with better attack timing and packet generation.
 """

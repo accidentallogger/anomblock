@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-
 ryu-manager ryu_insdn_full.py --verbose
 
 ryu_insdn_full.py
