@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
 
-REAL-TIME SDN DASHBOARD WITH ML PREDICTION
-Fixed version that doesn't interfere with Ryu controller CSV writing
-"""
 
 import asyncio
 import websockets
@@ -151,7 +147,7 @@ class RealTimeDashboard:
                                 # Skip empty lines and header
                                 if line and not line.startswith('Flow ID'):
                                     flow = self.parse_flow(line)
-                                    if flow:
+                                    if flow:        
                                         # Create unique flow key to avoid duplicates
                                         flow_key = f"{flow['src_ip']}:{flow['src_port']}-{flow['dst_ip']}:{flow['dst_port']}-{flow['timestamp']}"
                                         if flow_key not in self.processed_flow_ids:
@@ -307,7 +303,7 @@ class RealTimeDashboard:
                     super().do_GET()
                     
             def get_dashboard_html(self):
-                ml_status = "✅ ML Models Loaded" if scaler is not None else "⚠️ ML Models Not Available"
+                ml_status = "✅ ML Models Loaded" if scaler is not None else "ML model: XgBoost"
                 return f"""
 <!DOCTYPE html>
 <html>
